@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in the bridge, wrapper or installer does not work.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Connect the DualSense over Bluetooth
+        2. Run ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `dualsense-bt2usb check`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Bridge log and errors
+      description: >
+        Bridge output or $XDG_RUNTIME_DIR/dualsense-bt2usb.log, plus relevant `dmesg` lines
+        (`dmesg | grep -i -e playstation -e uhid`). Remove MAC addresses before pasting.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution, kernel and Python version
+      placeholder: Fedora 44, kernel 7.2.x, Python 3.14
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: dualsense-bt2usb version or commit
+      placeholder: output of `dualsense-bt2usb --version` or the commit hash

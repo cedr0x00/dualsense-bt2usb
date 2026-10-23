@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# dualsense-bt2usb-run: run a command (a game) with the Bluetooth DualSense bridge active.
+#
+#   dualsense-bt2usb-run <command> [args...]
+#   Steam launch options:  dualsense-bt2usb-run %command%
+#
+# The bridge starts only when a DualSense is connected over Bluetooth and /dev/uhid is
+# writable; otherwise the command runs unchanged. The bridge stops when the command exits.
+#
+# Copyright (c) 2026 dualsense-bt2usb contributors. Licensed under the MIT License (see LICENSE).
+set -u
+
+[[ $# -gt 0 ]] || { echo "usage: dualsense-bt2usb-run <command> [args...]" >&2; exit 2; }
+
+BRIDGE=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/dualsense-bt2usb
+[[ -x $BRIDGE ]] || BRIDGE=$(command -v dualsense-bt2usb || true)
+LOG=${DS_BT2USB_LOG:-${XDG_RUNTIME_DIR:-/tmp}/dualsense-bt2usb.log}
+
+# Proton builds that ship an automatic Sony->XInput fallback (e.g. some GE-Proton builds)
+# would otherwise hand the game an "Xbox 360" pad first. Unknown variables are harmless.
+export PROTON_SONY_AUTO_XINPUT=${PROTON_SONY_AUTO_XINPUT:-0}
+export PROTON_NO_STEAMINPUT=${PROTON_NO_STEAMINPUT:-1}
+
+bt_pad=0
+for node in /sys/class/hidraw/hidraw*; do
+    grep -qiE '^HID_ID=0005:0000054C:00000(CE6|DF2)$' "$node/device/uevent" 2>/dev/null && bt_pad=1
+done
+
+bridge_pid=''
+if [[ ${DS_BT2USB_DISABLE:-0} == 1 ]]; then
+    :
+elif [[ -z $BRIDGE ]]; then
+    echo 'dualsense-bt2usb-run: dualsense-bt2usb not found; running without bridge' >&2
+elif [[ $bt_pad == 1 && -w /dev/uhid ]]; then
+    python3 -I "$BRIDGE" run >"$LOG" 2>&1 &
+    bridge_pid=$!
+    # Wait for the virtual USB pad so the game sees it from its first scan.
+    for _ in $(seq 1 50); do
+        grep -qs 'HID_PHYS=dualsense-bt2usb' /sys/class/hidraw/hidraw*/device/uevent && break
+        kill -0 "$bridge_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    if ! kill -0 "$bridge_pid" 2>/dev/null; then
+        echo "dualsense-bt2usb-run: bridge failed to start; see $LOG" >&2
+        bridge_pid=''
+    elif ! grep -qs 'HID_PHYS=dualsense-bt2usb' /sys/class/hidraw/hidraw*/device/uevent; then
+        echo "dualsense-bt2usb-run: virtual pad did not appear yet; see $LOG" >&2
+    fi
+elif [[ $bt_pad == 1 ]]; then
+    echo 'dualsense-bt2usb-run: /dev/uhid is not writable; install the udev rule (see README)' >&2
+fi
+
+cleanup() {
+    [[ -n $bridge_pid ]] && kill "$bridge_pid" 2>/dev/null
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+"$@"

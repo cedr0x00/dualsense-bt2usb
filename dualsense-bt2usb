@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""dualsense-bt2usb: present a Bluetooth DualSense as a USB DualSense.
+
+Some Windows games running under Wine/Proton only accept the DualSense through its
+USB HID layout and ignore it over Bluetooth. This bridge reads the Bluetooth
+controller from hidraw and recreates it through /dev/uhid as a USB device (bus 0x03,
+USB report descriptor), translating input, output and feature reports both ways.
+
+Copyright (c) 2026 dualsense-bt2usb contributors. Licensed under the MIT License (see LICENSE).
+"""
+import argparse
+import errno
+import fcntl
+import glob
+import os
+import select
+import signal
+import struct
+import sys
+import zlib
+
+__version__ = '1.0.0'
+
+VID, PIDS = 0x054C, (0x0CE6, 0x0DF2)
+BUS_USB, BUS_BLUETOOTH = 0x03, 0x05
+
+UHID_DESTROY, UHID_OUTPUT = 1, 6
+UHID_GET_REPORT, UHID_GET_REPORT_REPLY, UHID_CREATE2 = 9, 10, 11
+UHID_INPUT2, UHID_SET_REPORT, UHID_SET_REPORT_REPLY = 12, 13, 14
+UHID_FEATURE_REPORT, UHID_OUTPUT_REPORT = 0, 1
+UHID_EVENT_SIZE = 4 + 4372  # u32 type + largest union member (uhid_create2_req)
+
+BT_INPUT_ID, BT_INPUT_LEN = 0x31, 78
+USB_INPUT_ID, USB_INPUT_LEN = 0x01, 64
+USB_OUTPUT_ID, BT_OUTPUT_ID, BT_OUTPUT_LEN = 0x02, 0x31, 78
+FEATURE_CALIBRATION, FEATURE_PAIRING_INFO = 0x05, 0x09
+# Feature reads that are safe over Bluetooth (calibration, pairing, firmware info).
+# Everything else, notably the USB audio/haptics test commands 0x80/0x81 that Wine
+# sends to a USB pad, is refused: over Bluetooth they stall and drop the controller.
+BT_SAFE_FEATURES = {FEATURE_CALIBRATION, FEATURE_PAIRING_INFO, 0x20, 0x22}
+# Feature writes some games insist on before accepting the pad; acknowledged locally
+# without touching the controller (games retry forever if they fail).
+ACK_ONLY_SET_FEATURES = {0x08}
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+DATA_HOME = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+DESCRIPTOR_DIRS = [os.path.normpath(d) for d in (
+    os.path.join(DATA_HOME, 'dualsense-bt2usb', 'descriptors'),
+    os.path.join(SCRIPT_DIR, '..', 'share', 'dualsense-bt2usb', 'descriptors'),
+    os.path.join(SCRIPT_DIR, 'descriptors'),
+)]
+
+
+def log(msg):
+    print(f'dualsense-bt2usb: {msg}', file=sys.stderr, flush=True)
+
+
+def hidioc(nr, size):
+    return (3 << 30) | (size << 16) | (ord('H') << 8) | nr
+
+
+def hidioc_gfeature(size):
+    return hidioc(0x07, size)
+
+
+def hidioc_sfeature(size):
+    return hidioc(0x06, size)
+
+
+def crc32_bt(seed, data):
+    return zlib.crc32(data, zlib.crc32(bytes([seed]))) & 0xFFFFFFFF
+
+
+def descriptor_name(pid):
+    return f'{VID:04x}-{pid:04x}.bin'
+
+
+def find_dualsense(bus):
+    for node in sorted(glob.glob('/sys/class/hidraw/hidraw*')):
+        try:
+            with open(f'{node}/device/uevent') as f:
+                uevent = dict(line.rstrip('\n').split('=', 1) for line in f if '=' in line)
+        except OSError:
+            continue
+        dev_bus, vid, pid = (int(x, 16) for x in uevent.get('HID_ID', '0:0:0').split(':'))
+        # Skip the virtual pad this tool creates when looking for a USB one.
+        if 'dualsense-bt2usb' in uevent.get('HID_PHYS', ''):
+            continue
+        if dev_bus == bus and vid == VID and pid in PIDS:
+            return node, f'/dev/{os.path.basename(node)}', pid, uevent.get('HID_UNIQ', '')
+    return None
+
+
+def find_descriptor(pid, explicit=None):
+    candidates = [explicit] if explicit else [os.path.join(d, descriptor_name(pid)) for d in DESCRIPTOR_DIRS]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+class Bridge:
+    def __init__(self, hidraw_path, pid, uniq, descriptor):
+        self.hidraw = os.open(hidraw_path, os.O_RDWR | os.O_NONBLOCK)
+        self.uhid = os.open('/dev/uhid', os.O_RDWR)
+        self.pid = pid
+        self.out_seq = 0
+        self.last_ack = {}
+        self.logged = set()
+        self.create(uniq, descriptor)
+
+    def send(self, event_type, payload):
+        ev = struct.pack('<I', event_type) + payload
+        os.write(self.uhid, ev.ljust(UHID_EVENT_SIZE, b'\0'))
+
+    def create(self, uniq, descriptor):
+        name = b'Sony Interactive Entertainment DualSense Wireless Controller'
+        payload = struct.pack('<128s64s64sHHIIII4096s', name, b'dualsense-bt2usb', uniq.encode(),
+                              len(descriptor), BUS_USB, VID, self.pid, 0x0100, 0, descriptor)
+        self.send(UHID_CREATE2, payload)
+
+    def destroy(self):
+        try:
+            self.send(UHID_DESTROY, b'')
+        except OSError:
+            pass
+
+    def detach(self):
+        if self.hidraw is not None:
+            os.close(self.hidraw)
+            self.hidraw = None
+            log('controller disconnected; waiting for it to reconnect')
+
+    def try_attach(self):
+        found = find_dualsense(BUS_BLUETOOTH)
+        if not found:
+            return
+        try:
+            self.hidraw = os.open(found[1], os.O_RDWR | os.O_NONBLOCK)
+        except OSError:
+            return
+        log(f'controller reconnected on {found[1]}')
+
+    def log_once(self, msg):
+        if msg not in self.logged:
+            self.logged.add(msg)
+            log(msg)
+
+    def reply(self, event_type, payload):
+        # The kernel drops requests answered too late; a stale reply must not kill the bridge.
+        try:
+            self.send(event_type, payload)
+        except OSError as e:
+            log(f'reply dropped: {e}')
+
+    def get_bt_feature(self, rnum):
+        if self.hidraw is None:
+            raise OSError(errno.ENODEV, 'controller disconnected')
+        buf = bytearray(600)
+        buf[0] = rnum
+        n = fcntl.ioctl(self.hidraw, hidioc_gfeature(len(buf)), buf)
+        return bytes(buf[:n])
+
+    # Bluetooth -> USB
+    def on_bt_input(self, data):
+        if not data:
+            return
+        if data[0] == BT_INPUT_ID and len(data) >= BT_INPUT_LEN:
+            usb = bytes([USB_INPUT_ID]) + data[2:2 + USB_INPUT_LEN - 1]
+            self.send(UHID_INPUT2, struct.pack('<H4096s', len(usb), usb))
+        elif data[0] == 0x01:
+            # Simple Bluetooth mode: reading calibration switches the pad to full 0x31 reports.
+            try:
+                self.get_bt_feature(FEATURE_CALIBRATION)
+            except OSError:
+                pass
+
+    # USB -> Bluetooth
+    def on_usb_output(self, data):
+        if not data or data[0] != USB_OUTPUT_ID or self.hidraw is None:
+            return
+        report = bytearray(BT_OUTPUT_LEN)
+        report[0] = BT_OUTPUT_ID
+        report[1] = (self.out_seq << 4) & 0xF0
+        report[2] = 0x10
+        common = data[1:48]
+        report[3:3 + len(common)] = common
+        self.out_seq = (self.out_seq + 1) & 0x0F
+        struct.pack_into('<I', report, BT_OUTPUT_LEN - 4, crc32_bt(0xA2, bytes(report[:-4])))
+        try:
+            os.write(self.hidraw, bytes(report))
+        except OSError:
+            self.detach()
+
+    def on_get_report(self, req_id, rnum, rtype):
+        err, data = 0, b''
+        try:
+            if rtype != UHID_FEATURE_REPORT:
+                raise OSError(errno.EIO, 'only feature reports are supported')
+            if rnum not in BT_SAFE_FEATURES:
+                raise OSError(errno.EIO, 'feature report not forwarded over Bluetooth')
+            data = self.get_bt_feature(rnum)
+            if rnum == FEATURE_PAIRING_INFO and len(data) >= 7:
+                # hid-playstation refuses a second pad with the real one's MAC; mark the
+                # virtual pad's address as locally administered so both can coexist.
+                data = bytearray(data)
+                data[6] |= 0x02
+                data = bytes(data)
+        except OSError as e:
+            err = e.errno or errno.EIO
+        self.log_once(f'get feature 0x{rnum:02x}: {"ok" if not err else errno.errorcode.get(err, err)}')
+        self.reply(UHID_GET_REPORT_REPLY, struct.pack('<IHH4096s', req_id, err, len(data), data))
+
+    def on_set_report(self, req_id, rnum, rtype, data):
+        err = 0
+        try:
+            if rtype == UHID_OUTPUT_REPORT:
+                self.on_usb_output(data)
+            elif rtype == UHID_FEATURE_REPORT and rnum in ACK_ONLY_SET_FEATURES:
+                if bytes(data) != self.last_ack.get(rnum):
+                    self.last_ack[rnum] = bytes(data)
+                    log(f'set feature 0x{rnum:02x} acknowledged locally: {bytes(data[:16]).hex()}')
+            elif rtype == UHID_FEATURE_REPORT:
+                if self.hidraw is None or rnum not in BT_SAFE_FEATURES:
+                    raise OSError(errno.EIO, 'feature report not forwarded over Bluetooth')
+                bt = bytearray(data) + b'\0' * 4
+                struct.pack_into('<I', bt, len(bt) - 4, crc32_bt(0x53, bytes(bt[:-4])))
+                fcntl.ioctl(self.hidraw, hidioc_sfeature(len(bt)), bt)
+            else:
+                raise OSError(errno.EIO, 'unsupported report type')
+        except OSError as e:
+            err = e.errno or errno.EIO
+        self.log_once(f'set report 0x{rnum:02x} type {rtype}: {"ok" if not err else errno.errorcode.get(err, err)}')
+        self.reply(UHID_SET_REPORT_REPLY, struct.pack('<IH', req_id, err))
+
+    def on_uhid_event(self, ev):
+        (event_type,) = struct.unpack_from('<I', ev)
+        body = ev[4:]
+        if event_type == UHID_OUTPUT:
+            size, rtype = struct.unpack_from('<HB', body, 4096)
+            if rtype == UHID_OUTPUT_REPORT:
+                self.on_usb_output(body[:size])
+        elif event_type == UHID_GET_REPORT:
+            req_id, rnum, rtype = struct.unpack_from('<IBB', body)
+            self.on_get_report(req_id, rnum, rtype)
+        elif event_type == UHID_SET_REPORT:
+            req_id, rnum, rtype, size = struct.unpack_from('<IBBH', body)
+            self.on_set_report(req_id, rnum, rtype, body[8:8 + size])
+
+    def run(self):
+        # Keep the virtual pad alive across power-offs so the game does not lose it;
+        # reattach to the Bluetooth hidraw node whenever the controller comes back.
+        while True:
+            if self.hidraw is None:
+                self.try_attach()
+            fds = [self.uhid] if self.hidraw is None else [self.hidraw, self.uhid]
+            ready, _, _ = select.select(fds, [], [], 0.5 if self.hidraw is None else None)
+            if self.hidraw is not None and self.hidraw in ready:
+                try:
+                    self.on_bt_input(os.read(self.hidraw, 600))
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    self.detach()
+            if self.uhid in ready:
+                self.on_uhid_event(os.read(self.uhid, UHID_EVENT_SIZE))
+
+
+def cmd_run(args):
+    found = find_dualsense(BUS_BLUETOOTH)
+    if not found:
+        log('no Bluetooth DualSense found')
+        return 2
+    _, hidraw_path, pid, uniq = found
+    descriptor_path = find_descriptor(pid, args.descriptor)
+    if not descriptor_path:
+        log(f'no USB descriptor for {VID:04x}:{pid:04x}; connect the pad by USB once and run '
+            f'"dualsense-bt2usb capture"')
+        return 4
+    with open(descriptor_path, 'rb') as f:
+        descriptor = f.read()
+    try:
+        bridge = Bridge(hidraw_path, pid, uniq, descriptor)
+    except PermissionError as e:
+        log(f'permission denied: {e.filename} (see README: udev rules)')
+        return 3
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    log(f'bridging {hidraw_path} as USB DualSense ({descriptor_path})')
+    try:
+        bridge.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bridge.destroy()
+    return 0
+
+
+def cmd_capture(args):
+    found = find_dualsense(BUS_USB)
+    if not found:
+        log('no USB DualSense found; connect the controller with a cable')
+        return 2
+    node, _, pid, _ = found
+    out = args.output or os.path.join(DESCRIPTOR_DIRS[0], descriptor_name(pid))
+    with open(f'{node}/device/report_descriptor', 'rb') as f:
+        descriptor = f.read()
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    with open(out, 'wb') as f:
+        f.write(descriptor)
+    log(f'saved {len(descriptor)}-byte USB descriptor for {VID:04x}:{pid:04x} to {out}')
+    return 0
+
+
+def cmd_check(args):
+    ok = True
+    uhid = os.access('/dev/uhid', os.R_OK | os.W_OK)
+    print(f'{"/dev/uhid writable:":<24}{"yes" if uhid else "no (install udev/71-uhid-uaccess.rules)"}')
+    ok &= uhid
+    for bus, label in ((BUS_BLUETOOTH, 'Bluetooth'), (BUS_USB, 'USB')):
+        found = find_dualsense(bus)
+        if not found:
+            print(f'{label + " DualSense:":<24}not connected')
+            continue
+        _, path, pid, _ = found
+        access = os.access(path, os.R_OK | os.W_OK)
+        print(f'{label + " DualSense:":<24}{path} ({VID:04x}:{pid:04x}), '
+              f'{"accessible" if access else "NO ACCESS (install game-devices-udev rules)"}')
+        ok &= access
+        descriptor = find_descriptor(pid)
+        print(f'{"USB descriptor:":<24}{descriptor or "missing (run: dualsense-bt2usb capture)"}')
+        ok &= bool(descriptor)
+    return 0 if ok else 1
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='dualsense-bt2usb',
+                                     description='Present a Bluetooth DualSense as a USB DualSense through uhid.')
+    parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
+    sub = parser.add_subparsers(dest='command')
+    run = sub.add_parser('run', help='run the bridge (default)')
+    run.add_argument('-d', '--descriptor', help='USB report descriptor file to expose')
+    capture = sub.add_parser('capture', help='save the USB report descriptor of a cable-connected DualSense')
+    capture.add_argument('output', nargs='?', help='output file (default: user data dir)')
+    sub.add_parser('check', help='check permissions, controller and descriptor')
+    args = parser.parse_args()
+    if args.command is None:
+        args = parser.parse_args(['run'] + sys.argv[1:])
+    return {'run': cmd_run, 'capture': cmd_capture, 'check': cmd_check}[args.command](args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

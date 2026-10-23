@@ -1,0 +1,3 @@
+# dualsense-bt2usb: let the logged-in user create virtual HID devices through uhid.
+# Install to /etc/udev/rules.d/ and reload udev (see README).
+KERNEL=="uhid", TAG+="uaccess"

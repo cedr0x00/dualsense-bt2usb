@@ -1,0 +1,90 @@
+name: Game report
+description: Tell us whether a game works with the bridge (working or not, both help).
+title: "[Game] <game name>: <works / Xbox prompts / not detected>"
+labels: [game-report]
+body:
+  - type: input
+    id: game
+    attributes:
+      label: Game
+      description: Name, and store if relevant (Steam, GOG, Epic...).
+      placeholder: Example Game (Steam)
+    validations:
+      required: true
+  - type: dropdown
+    id: result
+    attributes:
+      label: Result with the bridge
+      options:
+        - Detected as DualSense (PlayStation prompts)
+        - Detected, but with Xbox prompts
+        - No controller detected
+        - Controller disconnects or stops responding
+    validations:
+      required: true
+  - type: dropdown
+    id: without-bridge
+    attributes:
+      label: Result without the bridge (same Bluetooth controller)
+      options:
+        - Not tested
+        - Detected as DualSense (bridge not needed)
+        - Detected, but with Xbox prompts
+        - No controller detected
+    validations:
+      required: true
+  - type: checkboxes
+    id: features
+    attributes:
+      label: What works in game
+      description: Tick only what you checked.
+      options:
+        - label: Buttons and sticks
+        - label: Light bar color
+        - label: Rumble
+        - label: Adaptive triggers
+        - label: Touchpad
+        - label: Motion / gyro
+  - type: input
+    id: proton
+    attributes:
+      label: Wine / Proton version
+      placeholder: GE-Proton11-9, Proton 10.0, Wine 10.x...
+    validations:
+      required: true
+  - type: input
+    id: launch
+    attributes:
+      label: How you launch the game
+      placeholder: Steam with "dualsense-bt2usb-run %command%", Lutris, umu-run...
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and kernel
+      placeholder: Fedora 44, kernel 7.2.x (output of uname -r)
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: Output of `dualsense-bt2usb check`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Bridge log
+      description: >
+        With the wrapper it is in $XDG_RUNTIME_DIR/dualsense-bt2usb.log. It lists the feature
+        reports the game asked for. If you paste dmesg or Proton logs too, remove MAC addresses.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else (environment variables you needed, Steam Input settings...).

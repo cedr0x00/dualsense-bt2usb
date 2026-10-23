@@ -1,0 +1,7 @@
+# dualsense-bt2usb: give the logged-in user access to DualSense hidraw nodes
+# (USB, Bluetooth and the virtual USB pad created by the bridge).
+# Not needed if your distribution already ships game-devices-udev / steam-devices rules.
+KERNEL=="hidraw*", KERNELS=="*054C:0CE6*", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", KERNELS=="*054C:0DF2*", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", MODE="0660", TAG+="uaccess"
